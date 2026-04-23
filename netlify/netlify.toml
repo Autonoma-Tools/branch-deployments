@@ -1,0 +1,97 @@
+# netlify.toml — branch-deployment configuration for Netlify.
+#
+# Netlify resolves settings in this order of specificity:
+#   1. Context-specific block (e.g. [context.deploy-preview]) — wins if matched.
+#   2. Branch-specific block (e.g. [context.staging]) — matched by branch name.
+#   3. [build] — global defaults.
+#
+# Context reference:
+#   - production        → deploys from the production branch (main).
+#   - deploy-preview    → deploys from pull requests.
+#   - branch-deploy     → deploys from any other branch you have enabled.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "20"
+  NPM_FLAGS = "--no-audit --no-fund"
+
+# ---------- Production (main branch) ----------
+[context.production]
+  command = "npm run build:production"
+
+[context.production.environment]
+  NEXT_PUBLIC_APP_ENV = "production"
+  NEXT_PUBLIC_API_BASE_URL = "https://api.example.com"
+  NEXT_PUBLIC_ANALYTICS_ENABLED = "true"
+  SENTRY_ENVIRONMENT = "production"
+
+# ---------- Deploy previews (pull requests) ----------
+[context.deploy-preview]
+  command = "npm run build:preview"
+
+[context.deploy-preview.environment]
+  NEXT_PUBLIC_APP_ENV = "preview"
+  NEXT_PUBLIC_API_BASE_URL = "https://staging-api.example.com"
+  NEXT_PUBLIC_ANALYTICS_ENABLED = "false"
+  SENTRY_ENVIRONMENT = "preview"
+  ROBOTS_NOINDEX = "true"
+
+# ---------- Branch deploys (non-PR, non-production branches) ----------
+[context.branch-deploy]
+  command = "npm run build:preview"
+
+[context.branch-deploy.environment]
+  NEXT_PUBLIC_APP_ENV = "branch"
+  NEXT_PUBLIC_API_BASE_URL = "https://staging-api.example.com"
+  NEXT_PUBLIC_ANALYTICS_ENABLED = "false"
+  SENTRY_ENVIRONMENT = "branch"
+  ROBOTS_NOINDEX = "true"
+
+# ---------- Named branch override (example: staging) ----------
+[context.staging]
+  command = "npm run build:staging"
+
+[context.staging.environment]
+  NEXT_PUBLIC_APP_ENV = "staging"
+  NEXT_PUBLIC_API_BASE_URL = "https://staging-api.example.com"
+  SENTRY_ENVIRONMENT = "staging"
+
+# ---------- Headers ----------
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+[[headers]]
+  for = "/_next/static/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# Block search engines on previews and branch deploys.
+[[context.deploy-preview.headers]]
+  for = "/*"
+  [context.deploy-preview.headers.values]
+    X-Robots-Tag = "noindex, nofollow"
+
+[[context.branch-deploy.headers]]
+  for = "/*"
+  [context.branch-deploy.headers.values]
+    X-Robots-Tag = "noindex, nofollow"
+
+# ---------- Redirects ----------
+[[redirects]]
+  from = "/home"
+  to = "/"
+  status = 301
+  force = true
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200

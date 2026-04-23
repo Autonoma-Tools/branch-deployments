@@ -1,0 +1,174 @@
+# .github/workflows/docker-preview.yml
+#
+# Per-PR Docker preview environments on a self-hosted VPS running Traefik.
+#
+# Required secrets:
+#   HOST           — VPS hostname or IP (e.g. previews.example.com).
+#   DEPLOY_USER    — SSH user with permission to run docker commands.
+#   SSH_KEY        — Private SSH key (PEM). The matching public key must be in DEPLOY_USER's authorized_keys.
+#
+# Required variables:
+#   PREVIEW_DOMAIN — Wildcard preview domain (e.g. preview.example.com). Final URL will be pr-<N>.preview.example.com.
+#
+# Prerequisites on the VPS:
+#   - Docker Engine installed and DEPLOY_USER in the `docker` group.
+#   - Traefik v2+ running with providers.docker enabled and a certresolver named `letsencrypt`.
+#   - A Docker network named `traefik` that Traefik watches.
+#
+# Flow:
+#   - opened / synchronize → build, push to GHCR, SSH into the VPS, docker run with Traefik labels.
+#   - closed                → SSH into the VPS, stop + remove the container, delete the image tag.
+
+name: Docker PR Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: docker-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_TAG: pr-${{ github.event.pull_request.number }}
+  CONTAINER_NAME: preview-pr-${{ github.event.pull_request.number }}
+  PREVIEW_HOST: pr-${{ github.event.pull_request.number }}.${{ vars.PREVIEW_DOMAIN }}
+
+jobs:
+  deploy:
+    if: github.event.action != 'closed'
+    name: Build and deploy preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=preview-${{ github.event.pull_request.number }}
+          cache-to: type=gha,scope=preview-${{ github.event.pull_request.number }},mode=max
+          build-args: |
+            APP_ENV=preview
+            COMMIT_SHA=${{ github.event.pull_request.head.sha }}
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy to VPS
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.HOST }}" \
+            IMAGE_NAME="${IMAGE_NAME}" \
+            IMAGE_TAG="${IMAGE_TAG}" \
+            CONTAINER_NAME="${CONTAINER_NAME}" \
+            PREVIEW_HOST="${PREVIEW_HOST}" \
+            GHCR_USER="${{ github.actor }}" \
+            GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}" \
+            'bash -s' <<"REMOTE"
+            set -euo pipefail
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+            docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
+            docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+            docker run -d \
+              --name "${CONTAINER_NAME}" \
+              --restart unless-stopped \
+              --network traefik \
+              --label "traefik.enable=true" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.rule=Host(\`${PREVIEW_HOST}\`)" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.entrypoints=websecure" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.tls=true" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.tls.certresolver=letsencrypt" \
+              --label "traefik.http.services.${CONTAINER_NAME}.loadbalancer.server.port=3000" \
+              --label "autonoma.preview.pr=${IMAGE_TAG#pr-}" \
+              -e APP_ENV=preview \
+              -e PREVIEW_HOST="${PREVIEW_HOST}" \
+              "${IMAGE_NAME}:${IMAGE_TAG}"
+            docker logout ghcr.io
+          REMOTE
+
+      - name: Wait for preview to become healthy
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsSL --max-time 5 "https://${PREVIEW_HOST}/healthz" >/dev/null; then
+              echo "Preview is healthy."
+              exit 0
+            fi
+            echo "Health check failed (attempt ${attempt}/10), retrying in 6s..."
+            sleep 6
+          done
+          echo "Preview did not become healthy within timeout." >&2
+          exit 1
+
+      - name: Comment preview URL on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: docker-preview
+          message: |
+            Docker preview is ready.
+
+            - URL: https://${{ env.PREVIEW_HOST }}
+            - Image: `${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}`
+            - Container: `${{ env.CONTAINER_NAME }}`
+            - Commit: `${{ github.event.pull_request.head.sha }}`
+
+  teardown:
+    if: github.event.action == 'closed'
+    name: Teardown preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Stop and remove container
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.HOST }}" \
+            CONTAINER_NAME="${CONTAINER_NAME}" \
+            IMAGE_NAME="${IMAGE_NAME}" \
+            IMAGE_TAG="${IMAGE_TAG}" \
+            'bash -s' <<"REMOTE"
+            set -euo pipefail
+            if docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
+              docker rm -f "${CONTAINER_NAME}"
+              echo "Removed container ${CONTAINER_NAME}."
+            else
+              echo "Container ${CONTAINER_NAME} not found — nothing to remove."
+            fi
+            docker image rm "${IMAGE_NAME}:${IMAGE_TAG}" 2>/dev/null || true
+          REMOTE
+
+      - name: Comment teardown on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: docker-preview
+          message: |
+            Docker preview `${{ env.CONTAINER_NAME }}` has been torn down.

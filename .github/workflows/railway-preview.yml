@@ -1,0 +1,150 @@
+# .github/workflows/railway-preview.yml
+#
+# Per-PR Railway preview environments.
+#
+# Required secrets:
+#   RAILWAY_TOKEN     — Railway project token with permission to create environments.
+#   RAILWAY_PROJECT_ID — The Railway project ID that owns the preview environments.
+#
+# Required variables (repository or organization level):
+#   RAILWAY_SERVICE_NAME — The Railway service to deploy (e.g. "web").
+#
+# Flow:
+#   - opened / synchronize (new commit)  → create or update the PR's environment, deploy, comment URL.
+#   - closed                              → delete the PR's environment.
+
+name: Railway PR Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: railway-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  RAILWAY_ENV_NAME: pr-${{ github.event.pull_request.number }}
+
+jobs:
+  deploy:
+    if: github.event.action != 'closed'
+    name: Deploy preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: |
+          curl -fsSL https://railway.com/install.sh | sh
+          echo "$HOME/.railway/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Railway CLI
+        run: railway --version
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Link project
+        run: railway link --project "${{ secrets.RAILWAY_PROJECT_ID }}"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Create or reuse environment
+        id: env
+        run: |
+          set -euo pipefail
+          ENV_NAME="${RAILWAY_ENV_NAME}"
+          echo "Using environment: ${ENV_NAME}"
+          if railway environment --json 2>/dev/null | grep -q "\"name\":\"${ENV_NAME}\""; then
+            echo "Environment ${ENV_NAME} already exists — reusing."
+          else
+            railway environment new "${ENV_NAME}" --duplicate production
+          fi
+          railway environment "${ENV_NAME}"
+          echo "name=${ENV_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Deploy service
+        run: |
+          railway up \
+            --service "${{ vars.RAILWAY_SERVICE_NAME }}" \
+            --environment "${{ steps.env.outputs.name }}" \
+            --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Extract service URL
+        id: url
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            URL=$(railway domain \
+              --service "${{ vars.RAILWAY_SERVICE_NAME }}" \
+              --environment "${{ steps.env.outputs.name }}" \
+              --json 2>/dev/null | jq -r '.[0].domain // empty')
+            if [ -n "${URL}" ]; then
+              echo "Resolved URL: https://${URL}"
+              echo "url=https://${URL}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "URL not ready yet (attempt ${attempt}/6), sleeping 10s..."
+            sleep 10
+          done
+          echo "Failed to resolve preview URL after 6 attempts." >&2
+          exit 1
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Comment preview URL on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: railway-preview
+          message: |
+            Railway preview is ready.
+
+            - Environment: `${{ steps.env.outputs.name }}`
+            - URL: ${{ steps.url.outputs.url }}
+            - Commit: `${{ github.event.pull_request.head.sha }}`
+
+  teardown:
+    if: github.event.action == 'closed'
+    name: Teardown preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install Railway CLI
+        run: |
+          curl -fsSL https://railway.com/install.sh | sh
+          echo "$HOME/.railway/bin" >> "$GITHUB_PATH"
+
+      - name: Link project
+        run: railway link --project "${{ secrets.RAILWAY_PROJECT_ID }}"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Delete environment
+        run: |
+          set -euo pipefail
+          ENV_NAME="${RAILWAY_ENV_NAME}"
+          if railway environment --json 2>/dev/null | grep -q "\"name\":\"${ENV_NAME}\""; then
+            railway environment delete "${ENV_NAME}" --yes
+            echo "Deleted environment ${ENV_NAME}."
+          else
+            echo "Environment ${ENV_NAME} not found — nothing to delete."
+          fi
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Comment teardown on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: railway-preview
+          message: |
+            Railway preview environment `${{ env.RAILWAY_ENV_NAME }}` has been torn down.

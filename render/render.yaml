@@ -1,0 +1,99 @@
+# render.yaml — Render Blueprint with automatic PR previews.
+#
+# The top-level `previews` block tells Render to automatically spin up a
+# preview environment for every pull request. Each preview inherits the
+# services defined below and applies the `previewValue` or `previewValueFrom`
+# overrides listed under each service's `envVars`.
+#
+# Docs: https://render.com/docs/preview-environments
+
+previews:
+  generation: automatic
+  expireAfterDays: 7
+
+services:
+  - type: web
+    name: web
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    rootDir: .
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    previewPlan: starter
+    envVars:
+      - key: NODE_ENV
+        value: production
+        previewValue: production
+      - key: APP_ENV
+        value: production
+        previewValue: preview
+      - key: NEXT_PUBLIC_APP_ENV
+        value: production
+        previewValue: preview
+      - key: NEXT_PUBLIC_API_BASE_URL
+        value: https://api.example.com
+        previewValue: https://staging-api.example.com
+      - key: NEXT_PUBLIC_ANALYTICS_ENABLED
+        value: "true"
+        previewValue: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: app-db
+          property: connectionString
+        previewValueFrom:
+          database:
+            name: app-db-preview
+            property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SENTRY_ENVIRONMENT
+        value: production
+        previewValue: preview
+
+  - type: worker
+    name: worker
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    rootDir: .
+    buildCommand: npm ci && npm run build:worker
+    startCommand: npm run start:worker
+    autoDeploy: true
+    previewPlan: starter
+    envVars:
+      - key: NODE_ENV
+        value: production
+        previewValue: production
+      - key: APP_ENV
+        value: production
+        previewValue: preview
+      - key: DATABASE_URL
+        fromDatabase:
+          name: app-db
+          property: connectionString
+        previewValueFrom:
+          database:
+            name: app-db-preview
+            property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: cache
+          type: redis
+          property: connectionString
+
+databases:
+  - name: app-db
+    plan: basic-256mb
+    region: oregon
+    postgresMajorVersion: "16"
+    previewPlan: basic-256mb
+
+  - name: app-db-preview
+    plan: basic-256mb
+    region: oregon
+    postgresMajorVersion: "16"
