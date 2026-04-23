@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "slug": "branch-deployments",
+  "step": "created",
+  "completed_specs": [],
+  "pending_specs": ["vercel-config", "netlify-config", "railway-workflow", "render-config", "docker-workflow"],
+  "created_at": "2026-04-23T14:44:36Z",
+  "updated_at": "2026-04-23T14:44:36Z"
+}
